@@ -31,6 +31,10 @@ Install dependencies:
 
 ```bash
 pip install pdfplumber requests numpy
+# for external insight config loading
+pip install pyyaml
+# for graph visualization scripts
+pip install networkx matplotlib
 ```
 
 For semantic retrieval (recommended):
@@ -49,6 +53,13 @@ pip install sentence-transformers faiss-cpu
 
 ```bash
 python main.py --pdf paper.pdf --model llama3.1:8b --out insight.txt
+```
+
+With citation-neighbor context from a prebuilt graph:
+
+```bash
+python main.py --pdf paper.pdf --model llama3.1:8b --out insight.txt \
+  --reference_graph reference_graph.json --paper_id <paper_id>
 ```
 
 ### Step 2 — Convert to readable Markdown
@@ -76,6 +87,26 @@ python insight_to_md.py --input insight.txt --out insight.md
 | `--max_excerpts_chars` | `12000` | Max characters sent to model as excerpts |
 | `--max_chunk_chars` | `900` | Max characters per individual chunk |
 | `--min_fields` | `6` | Minimum filled fields to accept Pass 1 without reformatting |
+| `--insight_config` | `insight_config.yaml` | YAML file with customizable sections, retrieval queries, and section descriptions |
+| `--reference_graph` | *(empty)* | Optional weighted reference-graph JSON to inject neighbor context |
+| `--paper_id` | *(auto)* | Graph paper id for the current PDF; inferred from first-page title if omitted |
+| `--max_neighbor_papers` | `8` | Number of neighboring papers to include in generation context |
+
+### Insight config YAML (`insight_config.yaml`)
+
+You can customize section names, retrieval queries, and generation instructions without editing `main.py`.
+
+```yaml
+sections:
+  - name: TITLE
+    query: "paper title name of the work"
+    description: "Write a concise, specific paper title on one line."
+```
+
+Each `sections` entry supports:
+- `name`: heading used in final output
+- `query`: retrieval query used to pull field-specific excerpts
+- `description`: section-specific writing instruction used in the generation prompt
 
 ### `insight_to_md.py`
 
@@ -158,7 +189,32 @@ These are useful for diagnosing template compliance issues.
 .
 ├── main.py                    # Main extraction and generation script
 ├── insight_to_md.py           # Converts .txt output to clean Markdown
+├── insight_config.yaml         # External section/query/description config
+├── scripts/build_reference_graph.py    # Build + store weighted citation graph JSON
+├── scripts/visualize_reference_graph.py # Render graph image from stored JSON
 ├── README.md
 ├── debug_excerpts.txt         # (generated) chunks sent to model
 └── debug_raw_final.txt        # (generated) raw model output
+```
+
+---
+
+## Reference graph workflow
+
+1. Build and store a weighted reference graph JSON from metadata:
+
+```bash
+python scripts/build_reference_graph.py --input papers.json --out reference_graph.json
+```
+
+2. Visualize the graph:
+
+```bash
+python scripts/visualize_reference_graph.py --graph reference_graph.json --out reference_graph.png
+```
+
+3. Use the graph neighbor information during insight generation:
+
+```bash
+python main.py --pdf paper.pdf --out insight.txt --reference_graph reference_graph.json
 ```
