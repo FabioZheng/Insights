@@ -1,0 +1,39 @@
+sections:
+  - name: TITLE
+    query: "paper title name of the work"
+    description: "Write a concise, specific paper title on one line."
+
+  - name: SUBTITLE
+    query: "value proposition key contribution one sentence"
+    description: "Write one sentence describing practical value/positioning."
+
+  - name: BACKGROUND
+    query: "motivation problem statement prior art limitations background"
+    description: >-
+      Under 200 words. Cover (1) why the field matters and (2) current limitations.
+      Prefer concrete details from excerpts.
+
+  - name: TECHNOLOGICAL INTRODUCTION
+    query: "method technique design innovation approach implementation"
+    description: >-
+      Under 350 words total. Must include: Methodology & achievement (1-3 sentences),
+      3 Main Innovations with exactly 3 bullets, and a mini markdown table
+      (Method | Key features) with 3-6 rows.
+
+  - name: RESEARCH GROUP
+    query: "author affiliation university institution research group"
+    description: "State lead researcher/group, affiliation, and research area if present."
+
+  - name: TECHNICAL ADVANTAGES
+    query: "performance improvement benchmark comparison result advantage"
+    description: >-
+      Under 70 words. Use bullets. Every bullet must contain concrete
+      numbers/ranges/comparisons from excerpts.
+
+  - name: CURRENT STATUS & FUTURE CHALLENGES
+    query: "current state future work limitation challenge outlook"
+    description: "Under 40 words."
+
+  - name: BUSINESS SUGGESTION
+    query: "application industry market potential use case deployment"
+    description: "Write 1-2 complete, domain-specific sentences ending with a period."

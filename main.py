@@ -34,6 +34,7 @@ Optional flags:
 """
 
 import argparse
+import difflib
 import json
 import math
 import os
@@ -45,6 +46,7 @@ from typing import Dict, List, Optional, Tuple
 
 import requests
 import numpy as np
+import yaml
 
 # PDF extraction
 try:
@@ -73,37 +75,72 @@ class Chunk:
     text: str
 
 
-FIELDS = [
-    "TITLE",
-    "SUBTITLE",
-    "BACKGROUND",
-    "TECHNOLOGICAL INTRODUCTION",
-    "RESEARCH GROUP",
-    "TECHNICAL ADVANTAGES",
-    "CURRENT STATUS & FUTURE CHALLENGES",
-    "BUSINESS SUGGESTION",
-]
-
-# Numbered list for prompts — anchors small models more reliably than prose
-FIELDS_NUMBERED = "\n".join(f"  {i+1}. {f}:" for i, f in enumerate(FIELDS))
-
-# v4: field-specific retrieval queries — each field targets different paper content
-FIELD_QUERIES: Dict[str, str] = {
-    "TITLE":                              "paper title name of the work",
-    "SUBTITLE":                           "value proposition key contribution one sentence",
-    "BACKGROUND":                         "motivation problem statement prior art limitations background",
-    "TECHNOLOGICAL INTRODUCTION":         "method technique design innovation approach implementation",
-    "RESEARCH GROUP":                     "author affiliation university institution research group",
-    "TECHNICAL ADVANTAGES":               "performance improvement benchmark comparison result advantage",
-    "CURRENT STATUS & FUTURE CHALLENGES": "current state future work limitation challenge outlook",
-    "BUSINESS SUGGESTION":                "application industry market potential use case deployment",
+DEFAULT_INSIGHT_SCHEMA = {
+    "sections": [
+        {
+            "name": "TITLE",
+            "query": "paper title name of the work",
+            "description": "Write a concise, specific paper title on one line.",
+        },
+        {
+            "name": "SUBTITLE",
+            "query": "value proposition key contribution one sentence",
+            "description": "Write one sentence describing practical value/positioning.",
+        },
+        {
+            "name": "BACKGROUND",
+            "query": "motivation problem statement prior art limitations background",
+            "description": (
+                "Under 200 words. Cover (1) why the field matters and (2) current limitations. "
+                "Prefer concrete details from excerpts."
+            ),
+        },
+        {
+            "name": "TECHNOLOGICAL INTRODUCTION",
+            "query": "method technique design innovation approach implementation",
+            "description": (
+                "Under 350 words total. Must include: Methodology & achievement (1-3 sentences), "
+                "3 Main Innovations with exactly 3 bullets, and a mini markdown table "
+                "(Method | Key features) with 3-6 rows."
+            ),
+        },
+        {
+            "name": "RESEARCH GROUP",
+            "query": "author affiliation university institution research group",
+            "description": "State lead researcher/group, affiliation, and research area if present.",
+        },
+        {
+            "name": "TECHNICAL ADVANTAGES",
+            "query": "performance improvement benchmark comparison result advantage",
+            "description": (
+                "Under 70 words. Use bullets. Every bullet must contain concrete "
+                "numbers/ranges/comparisons from excerpts."
+            ),
+        },
+        {
+            "name": "CURRENT STATUS & FUTURE CHALLENGES",
+            "query": "current state future work limitation challenge outlook",
+            "description": "Under 40 words.",
+        },
+        {
+            "name": "BUSINESS SUGGESTION",
+            "query": "application industry market potential use case deployment",
+            "description": "Write 1-2 complete, domain-specific sentences ending with a period.",
+        },
+    ]
 }
+
+FIELDS: List[str] = []
+FIELD_QUERIES: Dict[str, str] = {}
+FIELD_DESCRIPTIONS: Dict[str, str] = {}
 
 # v4: regex for lines containing measurement units — used by numeric evidence helper
 _NUMERIC_UNITS_RE = re.compile(
     r"\b\d[\d.,]*\s*(?:GHz|MHz|kHz|dBi|dB|%|mm|cm|μm|nm|ns|ps|W|mW|dBm)\b",
     re.IGNORECASE,
 )
+
+apply_insight_schema(DEFAULT_INSIGHT_SCHEMA)
 
 
 # ---------------------------------------------------------------------------
@@ -146,6 +183,43 @@ def strip_markdown(text: str) -> str:
         line = re.sub(r"^#{1,6}\s*", "", line)
         cleaned.append(line)
     return "\n".join(cleaned)
+
+
+def apply_insight_schema(schema: Dict[str, object]) -> None:
+    """Apply external schema to global section settings."""
+    sections = schema.get("sections")
+    if not isinstance(sections, list) or not sections:
+        raise ValueError("Invalid insight config: 'sections' must be a non-empty list.")
+
+    fields: List[str] = []
+    queries: Dict[str, str] = {}
+    descriptions: Dict[str, str] = {}
+
+    for i, section in enumerate(sections, start=1):
+        if not isinstance(section, dict):
+            raise ValueError(f"Invalid insight config: section #{i} must be a mapping.")
+        name = str(section.get("name", "")).strip().upper()
+        if not name:
+            raise ValueError(f"Invalid insight config: section #{i} missing 'name'.")
+        if name in descriptions:
+            raise ValueError(f"Invalid insight config: duplicate section name '{name}'.")
+        fields.append(name)
+        queries[name] = str(section.get("query", "")).strip()
+        descriptions[name] = str(section.get("description", "")).strip()
+
+    global FIELDS, FIELD_QUERIES, FIELD_DESCRIPTIONS
+    FIELDS = fields
+    FIELD_QUERIES = queries
+    FIELD_DESCRIPTIONS = descriptions
+
+
+def load_insight_schema(config_path: str) -> None:
+    """Load section names, retrieval queries, and section descriptions from YAML."""
+    with open(config_path, "r", encoding="utf-8") as f:
+        schema = yaml.safe_load(f) or {}
+    if not isinstance(schema, dict):
+        raise ValueError("Invalid insight config: root must be a mapping/object.")
+    apply_insight_schema(schema)
 
 
 # ---------------------------------------------------------------------------
@@ -369,6 +443,117 @@ def build_excerpts_block(
     return "\n\n".join(parts)
 
 
+def _norm_key(s: str) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", s.lower())).strip()
+
+
+def infer_paper_id_from_pages(
+    pages: List[Tuple[int, str]],
+    node_titles: Dict[str, str],
+    explicit_paper_id: str = "",
+) -> str:
+    if explicit_paper_id:
+        return explicit_paper_id
+
+    if not pages:
+        return ""
+
+    first_page = pages[0][1]
+    line_candidates = [ln.strip() for ln in first_page.splitlines() if ln.strip()]
+    if not line_candidates:
+        return ""
+
+    candidate = line_candidates[0]
+    if len(line_candidates) > 1 and len(candidate.split()) < 3:
+        candidate = line_candidates[1]
+
+    if candidate in node_titles:
+        return candidate
+
+    norm_to_id = {_norm_key(v): k for k, v in node_titles.items() if v}
+    cand_norm = _norm_key(candidate)
+    if cand_norm in norm_to_id:
+        return norm_to_id[cand_norm]
+
+    fuzzy = difflib.get_close_matches(cand_norm, list(norm_to_id.keys()), n=1, cutoff=0.65)
+    if fuzzy:
+        return norm_to_id[fuzzy[0]]
+    return ""
+
+
+def build_reference_neighbor_context(
+    graph_path: str,
+    pages: List[Tuple[int, str]],
+    explicit_paper_id: str = "",
+    max_neighbors: int = 8,
+) -> str:
+    """
+    Load a stored reference graph and build neighbor context for the current paper.
+    This context can be appended to excerpt blocks to improve generation quality.
+    """
+    if not graph_path or not os.path.exists(graph_path):
+        return ""
+
+    with open(graph_path, "r", encoding="utf-8") as f:
+        graph = json.load(f)
+
+    nodes = graph.get("nodes", [])
+    edges = graph.get("edges", [])
+    if not isinstance(nodes, list) or not isinstance(edges, list):
+        return ""
+
+    node_map: Dict[str, Dict[str, object]] = {}
+    node_titles: Dict[str, str] = {}
+    for n in nodes:
+        if not isinstance(n, dict):
+            continue
+        nid = str(n.get("id", "")).strip()
+        if not nid:
+            continue
+        node_map[nid] = n
+        node_titles[nid] = str(n.get("title", "")).strip()
+
+    paper_id = infer_paper_id_from_pages(pages, node_titles, explicit_paper_id)
+    if not paper_id or paper_id not in node_map:
+        return ""
+
+    neighbor_scores: Dict[str, float] = {}
+    for e in edges:
+        if not isinstance(e, dict):
+            continue
+        src = str(e.get("source", "")).strip()
+        dst = str(e.get("target", "")).strip()
+        weight = float(e.get("weight", 1.0))
+        if src == paper_id and dst in node_map:
+            neighbor_scores[dst] = neighbor_scores.get(dst, 0.0) + weight
+        elif dst == paper_id and src in node_map:
+            neighbor_scores[src] = neighbor_scores.get(src, 0.0) + weight
+
+    if not neighbor_scores:
+        return ""
+
+    ranked = sorted(neighbor_scores.items(), key=lambda x: x[1], reverse=True)[:max_neighbors]
+    lines = [f"REFERENCE GRAPH CONTEXT for paper_id={paper_id}:"]
+    for nid, score in ranked:
+        node = node_map[nid]
+        title = str(node.get("title", "")).strip()
+        abstract = safe_cut_chars(str(node.get("abstract", "")).strip(), 240)
+        keywords = node.get("keywords", [])
+        if isinstance(keywords, list):
+            kws = ", ".join(str(k) for k in keywords[:8])
+        else:
+            kws = str(keywords)
+        lines.append(f"- Neighbor (weight={score:.3f}) id={nid}")
+        if title:
+            lines.append(f"  title: {title}")
+        if kws:
+            lines.append(f"  keywords: {kws}")
+        if abstract:
+            lines.append(f"  abstract: {abstract}")
+
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------------------
 # v4: field-specific retrieval helpers
 # ---------------------------------------------------------------------------
@@ -477,52 +662,54 @@ _HEADING_EXAMPLE = (
     "BUSINESS SUGGESTION: <content>"
 )
 
-# FIX v3: numbered field list placed FIRST in all prompts so small models see it early
-_FIELD_LIST_BLOCK = (
-    "YOU MUST OUTPUT EXACTLY THESE 8 SECTIONS IN THIS ORDER (all-caps, no markdown, no bold, no #):\n"
-    + FIELDS_NUMBERED
-    + "\n\n"
-)
+def build_field_list_block() -> str:
+    fields_numbered = "\n".join(f"  {i+1}. {f}:" for i, f in enumerate(FIELDS))
+    return (
+        f"YOU MUST OUTPUT EXACTLY THESE {len(FIELDS)} SECTIONS IN THIS ORDER "
+        "(all-caps, no markdown, no bold, no #):\n"
+        + fields_numbered
+        + "\n\n"
+    )
 
-_TEMPLATE_RULES = (
-    _FIELD_LIST_BLOCK
-    + "OUTPUT FORMAT EXAMPLE:\n"
-    + _HEADING_EXAMPLE
-    + "\n\n"
-    "STRICT WORD LIMITS:\n"
-    "- BACKGROUND: under 200 words. Cover (1) why the field matters; (2) current limitations.\n"
-    "- TECHNOLOGICAL INTRODUCTION: under 350 words TOTAL. Must contain:\n"
-    "    Methodology & achievement: 1-3 sentences.\n"
-    "    3 Main Innovations:\n"
-    "    - <innovation 1>\n"
-    "    - <innovation 2>\n"
-    "    - <innovation 3>\n"
-    "    Mini Table (Method | Key features):\n"
-    "    | Method | Key features |\n"
-    "    | ... | ... |\n"
-    "    (3-6 rows)\n"
-    "- TECHNICAL ADVANTAGES: under 70 words. Use bullets. MUST include specific numbers from the paper.\n"
-    "- CURRENT STATUS & FUTURE CHALLENGES: under 40 words.\n"
-    "- BUSINESS SUGGESTION: 1-2 complete sentences specific to this paper's technology domain.\n\n"
 
-    "CRITICAL QUANTITATIVE REQUIREMENTS:\n"
-    "★ ALWAYS extract and report SPECIFIC NUMBERS from the excerpts:\n"
-    "  - Percentage improvements (e.g., '17.2% wider bandwidth')\n"
-    "  - Absolute values (e.g., '300 EM simulations vs 1000 baseline')\n"
-    "  - Ranges (e.g., '6-14 variables reduced to 2-5 dimensions')\n"
-    "  - Comparisons (e.g., '40% sample reduction vs full kriging')\n"
-    "  - Time/cost savings (e.g., '70% faster than PSO')\n"
-    "★ In TECHNICAL ADVANTAGES, every bullet MUST anchor claims with concrete metrics.\n"
-    "★ Prefer RANGES over single numbers when ranges are given.\n"
-    "★ Avoid vague phrases like 'significant gains' — always use concrete numbers.\n\n"
-
-    "CRITICAL FORMATTING RULES:\n"
-    "- Do NOT wrap headings in **, __, or # characters.\n"
-    "- Each heading must start at the beginning of a new line, followed by a colon.\n"
-    "- Do NOT add any preamble before TITLE:.\n"
-    "- COMPLETE all 8 sections fully. Do NOT end abruptly mid-sentence.\n"
-    "- If information is absent from EXCERPTS write: Not found in provided text.\n"
-)
+def build_template_rules() -> str:
+    return (
+        build_field_list_block()
+        + "OUTPUT FORMAT EXAMPLE:\n"
+        + _HEADING_EXAMPLE
+        + "\n\n"
+        "STRICT WORD LIMITS:\n"
+        "- BACKGROUND: under 200 words. Cover (1) why the field matters; (2) current limitations.\n"
+        "- TECHNOLOGICAL INTRODUCTION: under 350 words TOTAL. Must contain:\n"
+        "    Methodology & achievement: 1-3 sentences.\n"
+        "    3 Main Innovations:\n"
+        "    - <innovation 1>\n"
+        "    - <innovation 2>\n"
+        "    - <innovation 3>\n"
+        "    Mini Table (Method | Key features):\n"
+        "    | Method | Key features |\n"
+        "    | ... | ... |\n"
+        "    (3-6 rows)\n"
+        "- TECHNICAL ADVANTAGES: under 70 words. Use bullets. MUST include specific numbers from the paper.\n"
+        "- CURRENT STATUS & FUTURE CHALLENGES: under 40 words.\n"
+        "- BUSINESS SUGGESTION: 1-2 complete sentences specific to this paper's technology domain.\n\n"
+        "CRITICAL QUANTITATIVE REQUIREMENTS:\n"
+        "★ ALWAYS extract and report SPECIFIC NUMBERS from the excerpts:\n"
+        "  - Percentage improvements (e.g., '17.2% wider bandwidth')\n"
+        "  - Absolute values (e.g., '300 EM simulations vs 1000 baseline')\n"
+        "  - Ranges (e.g., '6-14 variables reduced to 2-5 dimensions')\n"
+        "  - Comparisons (e.g., '40% sample reduction vs full kriging')\n"
+        "  - Time/cost savings (e.g., '70% faster than PSO')\n"
+        "★ In TECHNICAL ADVANTAGES, every bullet MUST anchor claims with concrete metrics.\n"
+        "★ Prefer RANGES over single numbers when ranges are given.\n"
+        "★ Avoid vague phrases like 'significant gains' — always use concrete numbers.\n\n"
+        "CRITICAL FORMATTING RULES:\n"
+        "- Do NOT wrap headings in **, __, or # characters.\n"
+        "- Each heading must start at the beginning of a new line, followed by a colon.\n"
+        "- Do NOT add any preamble before TITLE:.\n"
+        f"- COMPLETE all {len(FIELDS)} sections fully. Do NOT end abruptly mid-sentence.\n"
+        "- If information is absent from EXCERPTS write: Not found in provided text.\n"
+    )
 
 
 def build_insight_prompt(excerpts: str) -> str:
@@ -531,11 +718,11 @@ def build_insight_prompt(excerpts: str) -> str:
         "Your report will be read by researchers and business stakeholders who need SPECIFIC, QUANTITATIVE details.\n\n"
         "GOLDEN RULE: Extract and report ALL concrete numbers, percentages, ranges, and comparisons from the excerpts.\n"
         "Never use vague language when specific metrics are available in the text.\n\n"
-        + _TEMPLATE_RULES
+        + build_template_rules()
         + "\nEXCERPTS:\n"
         + excerpts
         + "\n\nBegin your output with TITLE: on the very first line. "
-        "Write ALL 8 sections completely — do not stop early.\n"
+        f"Write ALL {len(FIELDS)} sections completely — do not stop early.\n"
     )
 
 
@@ -543,7 +730,7 @@ def build_reformat_prompt(excerpts: str, draft: str) -> str:
     # FIX v3: numbered list at the very top for maximum small-model compliance
     return (
         "REFORMAT TASK: Convert the DRAFT below into the exact 8-section 'Technological Insight' template.\n\n"
-        + _TEMPLATE_RULES
+        + build_template_rules()
         + "\nEXCERPTS (source of truth for facts and numbers):\n"
         + excerpts
         + "\n\nDRAFT (reformat this — add missing numbers from EXCERPTS if absent):\n"
@@ -559,7 +746,7 @@ def build_continuation_prompt(excerpts: str, partial: str, missing_fields: List[
     return (
         f"The following sections are MISSING from a Technological Insight report: {fields_str}\n\n"
         "Write ONLY those missing sections, using the EXCERPTS as the source of truth.\n\n"
-        + _FIELD_LIST_BLOCK
+        + build_field_list_block()
         + "CRITICAL FORMATTING RULES:\n"
         "- Use ALL-CAPS heading followed by colon (e.g. RESEARCH GROUP:)\n"
         "- No markdown, no bold, no # symbols.\n"
@@ -575,28 +762,6 @@ def build_continuation_prompt(excerpts: str, partial: str, missing_fields: List[
 def build_single_section_prompt(field: str, excerpts: str, context_so_far: str = "",
                                 numeric_evidence: str = "") -> str:
     """Generate exactly one requested field at a time."""
-    field_rules: Dict[str, str] = {
-        "TITLE": "Write a concise, specific paper title on one line.",
-        "SUBTITLE": "Write one sentence describing practical value/positioning.",
-        "BACKGROUND": (
-            "Under 200 words. Cover (1) why the field matters and (2) current limitations. "
-            "Prefer concrete details from excerpts."
-        ),
-        "TECHNOLOGICAL INTRODUCTION": (
-            "Under 350 words total. Must include: "
-            "Methodology & achievement (1-3 sentences), "
-            "3 Main Innovations with exactly 3 bullets, "
-            "and a mini markdown table (Method | Key features) with 3-6 rows."
-        ),
-        "RESEARCH GROUP": "State lead researcher/group, affiliation, and research area if present.",
-        "TECHNICAL ADVANTAGES": (
-            "Under 70 words. Use bullets. Every bullet must contain concrete numbers/ranges/comparisons "
-            "from excerpts."
-        ),
-        "CURRENT STATUS & FUTURE CHALLENGES": "Under 40 words.",
-        "BUSINESS SUGGESTION": "Write 1-2 complete, domain-specific sentences ending with a period.",
-    }
-
     prior_context = ""
     if context_so_far.strip():
         prior_context = (
@@ -612,7 +777,7 @@ def build_single_section_prompt(field: str, excerpts: str, context_so_far: str =
         "Do not output any other headings, preamble, markdown fences, or explanations.\n"
         "If data is absent, write exactly: Not found in provided text.\n\n"
         f"SECTION-SPECIFIC RULES for {field}:\n"
-        f"- {field_rules[field]}\n\n"
+        f"- {FIELD_DESCRIPTIONS.get(field, 'Use only facts from excerpts.')}\n\n"
         "Global numeric rule: include concrete numbers/percentages/ranges/comparisons whenever available.\n\n"
         + prior_context
         + "EXCERPTS:\n"
@@ -636,6 +801,7 @@ def generate_sections_separately(
     include_first_pages: int = 3,
     max_excerpts_chars: int = 12000,
     max_chunk_chars: int = 900,
+    neighbor_context: str = "",
 ) -> Dict[str, str]:
     """Primary generation path: produce each template field in separate model calls.
 
@@ -677,6 +843,11 @@ def generate_sections_separately(
             field_excerpts = safe_cut_chars(first_page_text, max_excerpts_chars)
         else:
             field_excerpts = excerpts
+        if neighbor_context:
+            field_excerpts = safe_cut_chars(
+                field_excerpts + "\n\n" + neighbor_context,
+                max_excerpts_chars,
+            )
 
         ev = numeric_evidence if field in _NUMERIC_FIELDS else ""
 
@@ -712,8 +883,9 @@ def _normalise_heading(line: str) -> Optional[str]:
     """
     Match a line to a FIELD regardless of markdown decoration or capitalisation.
 
-    FIX v3: prefix match now requires the candidate to cover ≥60% of the field
-    name AND be at least 12 characters long, preventing short accidental matches.
+    Prefix match now requires the candidate to cover ≥60% of field length
+    and at least 4 characters to reduce accidental matches while allowing
+    customizable section names.
     """
     # Strip leading decoration: whitespace, #, *, _, -, bullets, numbered list markers
     clean = re.sub(r"^[\s#*_•\-]*(?:\d+[.):]?\s*|\(\d+\)\s*)?", "", line)
@@ -730,10 +902,10 @@ def _normalise_heading(line: str) -> Optional[str]:
     for field in FIELDS:
         if heading_part == field:
             return field
-        # FIX v3: stricter prefix — must cover ≥60% of field length and ≥12 chars
+        # Stricter prefix — must cover ≥60% of field length and ≥4 chars
         if (
             field.startswith(heading_part)
-            and len(heading_part) >= 12
+            and len(heading_part) >= 4
             and len(heading_part) >= int(len(field) * 0.6)
         ):
             return field
@@ -894,10 +1066,32 @@ def main() -> None:
     ap.add_argument("--max_chunk_chars",     type=int, default=900)
     ap.add_argument("--min_fields",          type=int, default=6,
                     help="Min filled fields in Pass 1 to skip reformat (default: 6)")
+    ap.add_argument(
+        "--insight_config",
+        default="insight_config.yaml",
+        help="YAML file defining sections with retrieval queries and descriptions.",
+    )
+    ap.add_argument("--reference_graph", default="",
+                    help="Optional path to a stored reference graph JSON.")
+    ap.add_argument("--paper_id", default="",
+                    help="Paper id in the reference graph (auto-inferred from first page title if omitted).")
+    ap.add_argument("--max_neighbor_papers", type=int, default=8,
+                    help="Maximum number of graph neighbors to inject as context.")
     args = ap.parse_args()
 
     if not os.path.exists(args.pdf):
         sys.exit(f"PDF not found: {args.pdf}")
+    if os.path.exists(args.insight_config):
+        try:
+            load_insight_schema(args.insight_config)
+            print(f"      Loaded insight config: {args.insight_config}")
+        except Exception as e:
+            sys.exit(f"Failed to load --insight_config '{args.insight_config}': {e}")
+    else:
+        print(
+            f"      Insight config not found at {args.insight_config}; "
+            "using built-in defaults."
+        )
 
     # 1. Extract
     print("[1/5] Extracting PDF text ...")
@@ -932,6 +1126,18 @@ def main() -> None:
     excerpts = build_excerpts_block(chosen,
                                     max_total_chars=args.max_excerpts_chars,
                                     max_chunk_chars=args.max_chunk_chars)
+    neighbor_context = build_reference_neighbor_context(
+        args.reference_graph,
+        pages,
+        explicit_paper_id=args.paper_id,
+        max_neighbors=args.max_neighbor_papers,
+    )
+    if neighbor_context:
+        excerpts = safe_cut_chars(
+            excerpts + "\n\n" + neighbor_context,
+            args.max_excerpts_chars,
+        )
+        print("      Added reference-graph neighbor context to excerpts.")
 
     with open("debug_excerpts.txt", "w", encoding="utf-8") as f:
         f.write(excerpts)
@@ -957,6 +1163,7 @@ def main() -> None:
         include_first_pages=args.include_first_pages,
         max_excerpts_chars=args.max_excerpts_chars,
         max_chunk_chars=args.max_chunk_chars,
+        neighbor_context=neighbor_context,
     )
 
     with open("debug_raw_final.txt", "w", encoding="utf-8") as f:
