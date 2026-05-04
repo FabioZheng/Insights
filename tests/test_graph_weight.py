@@ -85,6 +85,7 @@ class GraphWeightTests(unittest.TestCase):
         w, comps = compute_graph_weight(a, b, g)
         self.assertLessEqual(w, 1.0)
         self.assertGreater(w, 0.0)
+        self.assertIn("repeated_mentions_score", comps)
 
     def test_missing_metadata_safe(self):
         w, comps = compute_graph_weight({"id": "a"}, {"id": "b"}, {"edges": []})
@@ -96,7 +97,6 @@ class GraphWeightTests(unittest.TestCase):
         self.assertNotEqual(s1, s2)
         self.assertGreater(s1, 0)
         self.assertGreater(s2, 0)
-
 
 if __name__ == "__main__":
     unittest.main()

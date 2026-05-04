@@ -79,7 +79,8 @@ def compute_graph_weight(paper_a, paper_b, graph) -> tuple[float, dict]:
 
     direct_citation = 1.0 if id_b in refs_a else 0.0
     reverse_citation = 1.0 if id_a in refs_b else 0.0
-    explicit_mention = 1.0 if title_b and title_b in blob_a else 0.0
+    mention_count = blob_a.count(title_b) if title_b else 0
+    repeated_mentions_score = min(float(mention_count) / 3.0, 1.0)
     shared_references_score = jaccard_score(refs_a, refs_b)
     co_citation_score = jaccard_score(citers_a, citers_b)
     shared_authors_score = jaccard_score(paper_a.get("authors", []), paper_b.get("authors", []))
@@ -89,7 +90,7 @@ def compute_graph_weight(paper_a, paper_b, graph) -> tuple[float, dict]:
     components = {
         "direct_citation": direct_citation,
         "reverse_citation": reverse_citation,
-        "explicit_mention": explicit_mention,
+        "repeated_mentions_score": repeated_mentions_score,
         "shared_references_score": shared_references_score,
         "co_citation_score": co_citation_score,
         "shared_authors_score": shared_authors_score,
@@ -99,7 +100,7 @@ def compute_graph_weight(paper_a, paper_b, graph) -> tuple[float, dict]:
     raw_graph_weight = (
         1.0 * direct_citation
         + 0.8 * reverse_citation
-        + 0.7 * explicit_mention
+        + 0.7 * repeated_mentions_score
         + 0.4 * shared_references_score
         + 0.4 * co_citation_score
         + 0.2 * shared_authors_score

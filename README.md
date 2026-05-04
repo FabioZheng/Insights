@@ -316,6 +316,18 @@ During generation:
 
 So changing YAML directly changes both retrieval behavior and prompt behavior per section.
 
+### Is the semantic store used when retrieving neighbors from the graph?
+
+Yes, but in two stages:
+
+1. **Neighbor retrieval (graph stage):** neighbors are selected using graph connectivity/edge weight.
+2. **Neighbor ranking + context stage:** once candidate neighbors are selected, semantic store fields
+   (`global_summary`, `main_findings`, `main_claims`, `evidence_summary`) are used to compute
+   semantic overlap with the field query and to build the appended context block.
+
+So graph structure chooses *who* is a neighbor; semantic store influences *which neighbor context*
+is most relevant and what text is appended to generation input.
+
 ### How were queries shaped before vs after YAML creation?
 
 **Before YAML (`insight_config.yaml`)**
@@ -372,12 +384,11 @@ section generation after the normal excerpt retrieval.
 - The semantic store is produced by `scripts/build_semantic_store.py` via LLM prompts over title/keywords/abstract.
 - During neighbor augmentation, claim/finding/evidence content is appended to generator input for referenced neighbors.
 
-#### 3) Relevance weighting combines graph strength + query overlap
+#### 3) Relevance weighting combines global graph relevance + local chunk relevance
 
-- For the current section, the field query (`FIELD_QUERIES[field]`) is tokenized.
-- `graph_weight` measures structural relationship strength from the citation graph.
-- `semantic_overlap_score` measures content relevance from findings/claims/evidence/summary overlap.
-- `final_neighbor_score = 0.7 * semantic_overlap_score + 0.3 * graph_weight`.
+- `graph_weight` is global paper-paper relevance from structural signals (citation/co-citation/shared metadata).
+- `semantic_score` is local chunk-neighbor relevance (current chunk text vs neighbor semantic fields).
+- `final_neighbor_score = 0.7 * semantic_score + 0.3 * graph_weight`.
 - A neighbor relevance score is computed from:
   - graph strength (`neighbor.weight`, weighted 2x), and
   - weighted textual overlap between query terms and semantic fields:
