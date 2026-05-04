@@ -134,11 +134,17 @@ FIELDS: List[str] = []
 FIELD_QUERIES: Dict[str, str] = {}
 FIELD_DESCRIPTIONS: Dict[str, str] = {}
 
+FIELDS: List[str] = []
+FIELD_QUERIES: Dict[str, str] = {}
+FIELD_DESCRIPTIONS: Dict[str, str] = {}
+
 # v4: regex for lines containing measurement units — used by numeric evidence helper
 _NUMERIC_UNITS_RE = re.compile(
     r"\b\d[\d.,]*\s*(?:GHz|MHz|kHz|dBi|dB|%|mm|cm|μm|nm|ns|ps|W|mW|dBm)\b",
     re.IGNORECASE,
 )
+
+apply_insight_schema(DEFAULT_INSIGHT_SCHEMA)
 
 apply_insight_schema(DEFAULT_INSIGHT_SCHEMA)
 
@@ -183,6 +189,43 @@ def strip_markdown(text: str) -> str:
         line = re.sub(r"^#{1,6}\s*", "", line)
         cleaned.append(line)
     return "\n".join(cleaned)
+
+
+def apply_insight_schema(schema: Dict[str, object]) -> None:
+    """Apply external schema to global section settings."""
+    sections = schema.get("sections")
+    if not isinstance(sections, list) or not sections:
+        raise ValueError("Invalid insight config: 'sections' must be a non-empty list.")
+
+    fields: List[str] = []
+    queries: Dict[str, str] = {}
+    descriptions: Dict[str, str] = {}
+
+    for i, section in enumerate(sections, start=1):
+        if not isinstance(section, dict):
+            raise ValueError(f"Invalid insight config: section #{i} must be a mapping.")
+        name = str(section.get("name", "")).strip().upper()
+        if not name:
+            raise ValueError(f"Invalid insight config: section #{i} missing 'name'.")
+        if name in descriptions:
+            raise ValueError(f"Invalid insight config: duplicate section name '{name}'.")
+        fields.append(name)
+        queries[name] = str(section.get("query", "")).strip()
+        descriptions[name] = str(section.get("description", "")).strip()
+
+    global FIELDS, FIELD_QUERIES, FIELD_DESCRIPTIONS
+    FIELDS = fields
+    FIELD_QUERIES = queries
+    FIELD_DESCRIPTIONS = descriptions
+
+
+def load_insight_schema(config_path: str) -> None:
+    """Load section names, retrieval queries, and section descriptions from YAML."""
+    with open(config_path, "r", encoding="utf-8") as f:
+        schema = yaml.safe_load(f) or {}
+    if not isinstance(schema, dict):
+        raise ValueError("Invalid insight config: root must be a mapping/object.")
+    apply_insight_schema(schema)
 
 
 def apply_insight_schema(schema: Dict[str, object]) -> None:
@@ -756,6 +799,311 @@ def build_referenced_neighbor_context(
         lines.append(f"      direct_citation: {float(comps.get('direct_citation', 0.0)):.4f}")
         lines.append(f"      reverse_citation: {float(comps.get('reverse_citation', 0.0)):.4f}")
         lines.append(f"      repeated_mentions_score: {float(comps.get('repeated_mentions_score', 0.0)):.4f}")
+        lines.append(f"      shared_references_score: {float(comps.get('shared_references_score', 0.0)):.4f}")
+        lines.append(f"      co_citation_score: {float(comps.get('co_citation_score', 0.0)):.4f}")
+        lines.append(f"      shared_authors_score: {float(comps.get('shared_authors_score', 0.0)):.4f}")
+        lines.append(f"      shared_venue_score: {float(comps.get('shared_venue_score', 0.0)):.4f}")
+        lines.append(f"      shared_concepts_score: {float(comps.get('shared_concepts_score', 0.0)):.4f}")
+    return "\n".join(lines)
+
+
+def _norm_key(s: str) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", s.lower())).strip()
+
+
+def infer_paper_id_from_pages(
+    pages: List[Tuple[int, str]],
+    node_titles: Dict[str, str],
+    explicit_paper_id: str = "",
+) -> str:
+    if explicit_paper_id:
+        return explicit_paper_id
+
+    if not pages:
+        return ""
+
+    first_page = pages[0][1]
+    line_candidates = [ln.strip() for ln in first_page.splitlines() if ln.strip()]
+    if not line_candidates:
+        return ""
+
+    candidate = line_candidates[0]
+    if len(line_candidates) > 1 and len(candidate.split()) < 3:
+        candidate = line_candidates[1]
+
+    if candidate in node_titles:
+        return candidate
+
+    norm_to_id = {_norm_key(v): k for k, v in node_titles.items() if v}
+    cand_norm = _norm_key(candidate)
+    if cand_norm in norm_to_id:
+        return norm_to_id[cand_norm]
+
+    fuzzy = difflib.get_close_matches(cand_norm, list(norm_to_id.keys()), n=1, cutoff=0.65)
+    if fuzzy:
+        return norm_to_id[fuzzy[0]]
+    return ""
+
+
+def build_reference_neighbor_context(
+    graph_path: str,
+    pages: List[Tuple[int, str]],
+    explicit_paper_id: str = "",
+    max_neighbors: int = 8,
+) -> List[Dict[str, object]]:
+    """
+    Load a stored reference graph and build neighbor context for the current paper.
+    This context can be appended to excerpt blocks to improve generation quality.
+    """
+    if not graph_path or not os.path.exists(graph_path):
+        return []
+
+    with open(graph_path, "r", encoding="utf-8") as f:
+        graph = json.load(f)
+
+    nodes = graph.get("nodes", [])
+    edges = graph.get("edges", [])
+    if not isinstance(nodes, list) or not isinstance(edges, list):
+        return []
+
+    node_map: Dict[str, Dict[str, object]] = {}
+    node_titles: Dict[str, str] = {}
+    for n in nodes:
+        if not isinstance(n, dict):
+            continue
+        nid = str(n.get("id", "")).strip()
+        if not nid:
+            continue
+        node_map[nid] = n
+        node_titles[nid] = str(n.get("title", "")).strip()
+
+    paper_id = infer_paper_id_from_pages(pages, node_titles, explicit_paper_id)
+    if not paper_id or paper_id not in node_map:
+        return []
+
+    neighbor_scores: Dict[str, float] = {}
+    neighbor_components: Dict[str, Dict[str, float]] = {}
+    for e in edges:
+        if not isinstance(e, dict):
+            continue
+        src = str(e.get("source", "")).strip()
+        dst = str(e.get("target", "")).strip()
+        weight = float(e.get("weight", 1.0))
+        comps = e.get("weight_components", {}) if isinstance(e.get("weight_components", {}), dict) else {}
+        if src == paper_id and dst in node_map:
+            neighbor_scores[dst] = neighbor_scores.get(dst, 0.0) + weight
+            base = neighbor_components.get(dst, {})
+            for k, v in comps.items():
+                if isinstance(v, (int, float)):
+                    base[k] = base.get(k, 0.0) + float(v)
+            neighbor_components[dst] = base
+        elif dst == paper_id and src in node_map:
+            neighbor_scores[src] = neighbor_scores.get(src, 0.0) + weight
+            base = neighbor_components.get(src, {})
+            for k, v in comps.items():
+                if isinstance(v, (int, float)):
+                    base[k] = base.get(k, 0.0) + float(v)
+            neighbor_components[src] = base
+
+    if not neighbor_scores:
+        return []
+
+    ranked = sorted(neighbor_scores.items(), key=lambda x: x[1], reverse=True)[:max_neighbors]
+    neighbors: List[Dict[str, object]] = []
+    for nid, score in ranked:
+        node = node_map[nid]
+        title = str(node.get("title", "")).strip()
+        abstract = safe_cut_chars(str(node.get("abstract", "")).strip(), 240)
+        keywords = node.get("keywords", [])
+        if not isinstance(keywords, list):
+            keywords = [str(keywords)] if str(keywords).strip() else []
+        neighbors.append({
+            "id": nid,
+            "weight": float(score),
+            "title": title,
+            "abstract": abstract,
+            "keywords": [str(k) for k in keywords[:8]],
+            "semantic_store": node.get("semantic_store", {}),
+            "weight_components": neighbor_components.get(nid, {}),
+        })
+    return neighbors
+
+
+def _reference_is_mentioned(excerpts: str, neighbor: Dict[str, object]) -> bool:
+    t = excerpts.lower()
+    nid = str(neighbor.get("id", "")).strip().lower()
+    title = str(neighbor.get("title", "")).strip().lower()
+    if nid and nid in t:
+        return True
+    if title and title in t:
+        return True
+    return False
+
+
+def build_bibliography_citation_map(
+    pages: List[Tuple[int, str]],
+    neighbors: List[Dict[str, object]],
+) -> Dict[str, str]:
+    """
+    Build mapping from citation markers like [12] -> neighbor paper id using
+    bibliography lines and fuzzy title matching.
+    """
+    if not pages or not neighbors:
+        return {}
+
+    all_text = "\n".join(t for _, t in pages)
+    lines = [ln.strip() for ln in all_text.splitlines() if ln.strip()]
+    ref_lines = [ln for ln in lines if re.match(r"^\[\d+\]\s+", ln)]
+    if not ref_lines:
+        return {}
+
+    title_to_id: Dict[str, str] = {}
+    for nb in neighbors:
+        t = str(nb.get("title", "")).strip()
+        nid = str(nb.get("id", "")).strip()
+        if t and nid:
+            title_to_id[_norm_key(t)] = nid
+
+    if not title_to_id:
+        return {}
+
+    mapping: Dict[str, str] = {}
+    for ln in ref_lines:
+        m = re.match(r"^\[(\d+)\]\s+(.*)$", ln)
+        if not m:
+            continue
+        idx, rest = m.group(1), m.group(2)
+        norm_rest = _norm_key(rest)
+        candidates = difflib.get_close_matches(norm_rest, list(title_to_id.keys()), n=1, cutoff=0.55)
+        if candidates:
+            mapping[idx] = title_to_id[candidates[0]]
+    return mapping
+
+
+def build_referenced_neighbor_context(
+    excerpts: str,
+    field: str,
+    field_query: str,
+    neighbors: List[Dict[str, object]],
+    citation_map: Optional[Dict[str, str]] = None,
+    max_neighbors: int = 3,
+) -> str:
+    """
+    Add neighbor context only when the current excerpt explicitly mentions the reference.
+    Also keep only neighbor info relevant to the current field query.
+    """
+    if not excerpts.strip() or not neighbors:
+        return ""
+
+    query_terms = {
+        t for t in re.findall(r"[a-zA-Z0-9]+", field_query.lower())
+        if len(t) > 2 and t not in _STOP_WORDS
+    }
+    if not query_terms:
+        query_terms = {"method", "result", "performance"}
+
+    scored: List[Tuple[float, Dict[str, object], str, str]] = []
+
+    def _extract_relevant_neighbor_snippet(text: str, terms: set, max_sentences: int = 2) -> str:
+        if not text.strip():
+            return ""
+        sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
+        if not sentences:
+            return safe_cut_chars(text.strip(), 200)
+        sent_scored: List[Tuple[int, str]] = []
+        for sent in sentences:
+            s_low = sent.lower()
+            overlap = sum(1 for q in terms if q in s_low)
+            if overlap > 0:
+                sent_scored.append((overlap, sent))
+        if not sent_scored:
+            return safe_cut_chars(text.strip(), 200)
+        sent_scored.sort(key=lambda x: x[0], reverse=True)
+        chosen = [s for _, s in sent_scored[:max_sentences]]
+        return safe_cut_chars(" ".join(chosen), 200)
+
+    cited_ids = set()
+    if citation_map:
+        for cidx in re.findall(r"\[(\d+)\]", excerpts):
+            nid = citation_map.get(cidx)
+            if nid:
+                cited_ids.add(nid)
+
+    for nb in neighbors:
+        nid = str(nb.get("id", "")).strip()
+        explicitly_mentioned = _reference_is_mentioned(excerpts, nb)
+        bracket_cited = nid in cited_ids if nid else False
+        if not explicitly_mentioned and not bracket_cited:
+            continue
+        title = str(nb.get("title", "")).strip()
+        abstract = str(nb.get("abstract", "")).strip()
+        semantic_store = nb.get("semantic_store", {}) if isinstance(nb.get("semantic_store", {}), dict) else {}
+        global_summary = str(semantic_store.get("global_summary", "")).strip()
+        main_findings = str(semantic_store.get("main_findings", "")).strip()
+        main_claims = str(semantic_store.get("main_claims", "")).strip()
+        evidence_summary = str(semantic_store.get("evidence_summary", "")).strip()
+        content_for_context = "\n".join(
+            x for x in [main_findings, main_claims, evidence_summary, global_summary] if x
+        ).strip() or abstract
+        keywords = nb.get("keywords", [])
+        kw_txt = ", ".join(str(k) for k in keywords) if isinstance(keywords, list) else str(keywords)
+        findings_blob = main_findings.lower()
+        claims_blob = main_claims.lower()
+        evidence_blob = evidence_summary.lower()
+        summary_blob = global_summary.lower()
+        title_kw_blob = f"{title} {kw_txt}".lower()
+        overlap_findings = sum(1 for q in query_terms if q in findings_blob)
+        overlap_claims = sum(1 for q in query_terms if q in claims_blob)
+        overlap_evidence = sum(1 for q in query_terms if q in evidence_blob)
+        overlap_summary = sum(1 for q in query_terms if q in summary_blob)
+        overlap_title_kw = sum(1 for q in query_terms if q in title_kw_blob)
+        overlap = overlap_findings + overlap_claims + overlap_evidence + overlap_summary + overlap_title_kw
+        if overlap <= 0:
+            continue
+        snippet = _extract_relevant_neighbor_snippet(content_for_context, query_terms, max_sentences=2)
+        semantic_overlap_score = min(
+            (
+                (1.2 * overlap_findings)
+                + (1.1 * overlap_claims)
+                + (1.0 * overlap_evidence)
+                + (0.9 * overlap_summary)
+                + (0.8 * overlap_title_kw)
+            ) / 6.0,
+            1.0,
+        )
+        graph_weight = float(nb.get("weight", 0.0))
+        final_neighbor_score = (0.7 * semantic_overlap_score) + (0.3 * graph_weight)
+        scored.append((final_neighbor_score, nb, kw_txt, snippet, semantic_overlap_score, graph_weight))
+
+    if not scored:
+        return ""
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    lines = ["REFERENCED NEIGHBOR CONTEXT (only cited/mentioned neighbors):"]
+    for relevance, nb, kw_txt, snippet, semantic_overlap_score, graph_weight in scored[:max_neighbors]:
+        lines.append(
+            f"- id={nb.get('id')} weight={float(nb.get('weight', 1.0)):.3f} score={relevance:.3f} "
+            f"title={str(nb.get('title', '')).strip()}"
+        )
+        if kw_txt:
+            lines.append(f"  relevant_keywords: {kw_txt}")
+        if snippet:
+            lines.append(f"  relevant_summary_snippet: {snippet}")
+        if main_findings:
+            lines.append(f"  findings: {safe_cut_chars(main_findings, 180)}")
+        if main_claims:
+            lines.append(f"  claims: {safe_cut_chars(main_claims, 180)}")
+        if evidence_summary:
+            lines.append(f"  evidence: {safe_cut_chars(evidence_summary, 180)}")
+        comps = nb.get("weight_components", {}) if isinstance(nb.get("weight_components", {}), dict) else {}
+        lines.append("  score_trace:")
+        lines.append(f"    semantic_overlap_score: {semantic_overlap_score:.4f}")
+        lines.append(f"    graph_weight: {graph_weight:.4f}")
+        lines.append(f"    final_neighbor_score: {relevance:.4f}")
+        lines.append("    graph_components:")
+        lines.append(f"      direct_citation: {float(comps.get('direct_citation', 0.0)):.4f}")
+        lines.append(f"      reverse_citation: {float(comps.get('reverse_citation', 0.0)):.4f}")
+        lines.append(f"      explicit_mention: {float(comps.get('explicit_mention', 0.0)):.4f}")
         lines.append(f"      shared_references_score: {float(comps.get('shared_references_score', 0.0)):.4f}")
         lines.append(f"      co_citation_score: {float(comps.get('co_citation_score', 0.0)):.4f}")
         lines.append(f"      shared_authors_score: {float(comps.get('shared_authors_score', 0.0)):.4f}")
